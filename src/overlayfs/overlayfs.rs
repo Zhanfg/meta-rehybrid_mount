@@ -167,6 +167,19 @@ fn collect_child_mount_points(root_path: &Path) -> Result<Vec<String>> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+fn prefer_legacy_ksu_lower_only(
+    mount_source: &str,
+    upperdir: Option<&Path>,
+    workdir: Option<&Path>,
+) -> bool {
+    // On some Android 6.6 kernels the new mount API accepts fsconfig("source", "KSU")
+    // for lower-only OverlayFS mounts but still exposes the mount as source="overlay"
+    // in /proc/*/mountinfo. KSU/Zygisk denylist cleanup relies on the observable source
+    // tag, so keep lower-only KSU child/staging overlays on the legacy mount(2) path,
+    // where the source argument is preserved as "KSU".
+    mount_source == "KSU" && upperdir.is_none() && workdir.is_none()
+}
+
 fn mount_overlay_core(
     lower_dirs: &[String],
     upperdir: Option<&Path>,
@@ -192,15 +205,7 @@ fn mount_overlay_core(
         workdir_s.as_deref().unwrap_or("none")
     );
 
-    if let Err(err) = utils::fsopen_mount(
-        upperdir_s.clone(),
-        workdir_s.clone(),
-        lowerdir_config.clone(),
-        mount_source,
-        dest,
-    ) {
-        log::warn!("fsopen failed, fallback to legacy mount: {err}");
-
+    let legacy_mount = || -> Result<()> {
         let safe_lower = lower_dirs
             .iter()
             .map(|path| escape_mount_option_value(path))
@@ -208,11 +213,11 @@ fn mount_overlay_core(
             .join(":");
         let mut data = format!("lowerdir={safe_lower}");
 
-        if let (Some(upperdir), Some(workdir)) = (upperdir_s, workdir_s) {
+        if let (Some(upperdir), Some(workdir)) = (upperdir_s.as_deref(), workdir_s.as_deref()) {
             data = format!(
                 "{data},upperdir={},workdir={}",
-                escape_mount_option_value(&upperdir),
-                escape_mount_option_value(&workdir)
+                escape_mount_option_value(upperdir),
+                escape_mount_option_value(workdir)
             );
         }
 
@@ -227,7 +232,24 @@ fn mount_overlay_core(
                     .as_c_str(),
             ),
         )
-        .map_err(|err| Error::msg(format!("legacy overlay mount {}: {err}", dest.display())))?;
+        .map_err(|err| Error::msg(format!("legacy overlay mount {}: {err}", dest.display())))
+    };
+
+    if prefer_legacy_ksu_lower_only(mount_source, upperdir, workdir) {
+        log::info!(
+            "using legacy overlay mount to preserve KSU source tag: dest={}",
+            dest.display()
+        );
+        legacy_mount()?;
+    } else if let Err(err) = utils::fsopen_mount(
+        upperdir_s.clone(),
+        workdir_s.clone(),
+        lowerdir_config.clone(),
+        mount_source,
+        dest,
+    ) {
+        log::warn!("fsopen failed, fallback to legacy mount: {err}");
+        legacy_mount()?;
     }
 
     log::debug!("overlay mount success: {}", dest.display());
@@ -462,6 +484,17 @@ mod tests {
     #[test]
     fn escape_mount_option_value_escapes_overlay_separators() {
         assert_eq!(escape_mount_option_value("/a,b:/c\\d"), "/a\\,b\\:/c\\\\d");
+    }
+
+    #[test]
+    fn ksu_lower_only_mounts_prefer_legacy_source_preserving_path() {
+        assert!(prefer_legacy_ksu_lower_only("KSU", None, None));
+        assert!(!prefer_legacy_ksu_lower_only("overlay", None, None));
+        assert!(!prefer_legacy_ksu_lower_only(
+            "KSU",
+            Some(Path::new("/upper")),
+            Some(Path::new("/work"))
+        ));
     }
 
     #[test]
